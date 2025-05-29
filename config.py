@@ -49,6 +49,13 @@ BOT_CONFIGS = {
     }
 }
 
+PROJECT_BOT_IDS = [
+    7432922492,  # Lucia
+    8151632568,  # Luna
+    7577560442,  # Leo
+    7973851098  # Bella
+]
+
 # Список известных брендов для нечеткого соответствия
 KNOWN_BRANDS = [
     "GUESS", "Gucci", "Burberry", "Dior", "Brunello Cucinelli", "Prada", "Versace",
