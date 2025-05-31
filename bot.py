@@ -38,15 +38,25 @@ async def send_with_retry(func, *args, max_retries=3, **kwargs):
     raise TelegramBadRequest("Max retries reached due to rate limits")
 
 async def queue_post(user_id, photo_ids, description, message_id, photo_count, forward_from_message_id=None):
-    photo_ids_str = ','.join(photo_ids)
-    if db.check_queue_duplicate(user_id, photo_ids, photo_count, description):
-        print(f"Debug - Duplicate post detected: user_id={user_id}, photo_ids={photo_ids_str}, photo_count={photo_count}")
+    if not photo_ids:
+        print(f"Debug - Cannot queue post with empty photo_ids: user_id={user_id}, message_id={message_id}")
+        await bot.send_message(user_id, "Ошибка: отсутствуют фото для поста.")
+        return False
+    valid_photo_ids = [pid for pid in photo_ids if db.is_valid_file_id(pid)]
+    if not valid_photo_ids:
+        print(f"Debug - No valid photo IDs after validation: user_id={user_id}, message_id={message_id}")
+        await bot.send_message(user_id, "Ошибка: недействительные идентификаторы фото.")
+        return False
+    photo_ids_str = ','.join(valid_photo_ids)
+    if db.check_queue_duplicate(user_id, valid_photo_ids, len(valid_photo_ids), description):
+        print(f"Debug - Duplicate post detected: user_id={user_id}, photo_ids={photo_ids_str}, photo_count={len(valid_photo_ids)}")
         await bot.send_message(user_id, "Этот пост уже в очереди.")
         return False
     try:
-        db.queue_post(user_id, photo_ids, description, message_id, photo_count, forward_from_message_id)
-        print(f"Debug - Queued post: user_id={user_id}, message_id={message_id}, photo_ids={photo_ids_str}, photo_count={photo_count}")
-        db.clear_pending_photos(user_id, message_id=message_id)  # Clear pending photos
+        db.queue_post(user_id, valid_photo_ids, description, message_id, len(valid_photo_ids), forward_from_message_id)
+        print(f"Debug - Queued post: user_id={user_id}, message_id={message_id}, photo_ids={photo_ids_str}, photo_count={len(valid_photo_ids)}")
+        # Clear only the specific pending photos for this post
+        db.clear_pending_photos(user_id, message_id=message_id, media_group_id=None)
         return True
     except mysql.connector.Error as e:
         print(f"Debug - Error queuing post: {e}")
@@ -68,36 +78,44 @@ async def process_queue():
                 db.update_queue_status(post_id, 'failed')
                 await bot.send_message(user_id, f"Ошибка: недействительные фото для поста {post_id}.")
                 await asyncio.sleep(5)
-                continue
-            try:
-                db.update_queue_status(post_id, 'processing')
-                class MockMessage:
-                    def __init__(self, user_id, message_id, photo_ids, caption, forward_from_message_id):
-                        self.message_id = message_id
-                        self.from_user = type('User', (), {'id': user_id})()
-                        self.chat = type('Chat', (), {'id': user_id})()
-                        self.photo = [MockPhoto(file_id=pid) for pid in photo_ids]
-                        self.caption = caption
-                        self.forward_from = None
-                        self.forward_from_chat = None
-                        self.forward_from_message_id = forward_from_message_id
-                    async def reply(self, text, **kwargs):
-                        return await bot.send_message(chat_id=self.from_user.id, text=text, **kwargs)
-                class MockPhoto:
-                    def __init__(self, file_id):
-                        self.file_id = file_id
-                        self.file_size = 1
-                mock_message = MockMessage(user_id, message_id, photo_ids, description, forward_from_message_id)
-                await handle_photo_post(mock_message)
-                db.update_queue_status(post_id, 'sent')
-                print(f"Debug - Successfully processed queued post: post_id={post_id}")
-                await bot.send_message(user_id, f"Пост отправлен: {description[:50]}{'...' if len(description) > 50 else ''}")
-                await asyncio.sleep(5)
-            except Exception as e:
-                print(f"Debug - Error processing queued post {post_id}: {e}")
-                db.update_queue_status(post_id, 'failed')
-                await bot.send_message(user_id, f"Ошибка при обработке поста {post_id}: {str(e)}")
-                await asyncio.sleep(5)
+            else:
+                try:
+                    db.update_queue_status(post_id, 'processing')
+                    class MockMessage:
+                        def __init__(self, user_id, message_id, photo_ids, caption, forward_from_message_id):
+                            self.message_id = message_id
+                            self.from_user = type('User', (), {'id': user_id})()
+                            self.chat = type('Chat', (), {'id': user_id})()
+                            self.photo = [MockPhoto(file_id=pid) for pid in photo_ids]
+                            self.caption = caption
+                            self.forward_from = None
+                            self.forward_from_chat = None
+                            self.forward_from_message_id = forward_from_message_id
+                        async def reply(self, text, **kwargs):
+                            return await bot.send_message(chat_id=self.from_user.id, text=text, **kwargs)
+                    class MockPhoto:
+                        def __init__(self, file_id):
+                            self.file_id = file_id
+                            self.file_size = 1
+                    mock_message = MockMessage(user_id, message_id, photo_ids, description, forward_from_message_id)
+                    await handle_photo_post(mock_message)
+                    db.update_queue_status(post_id, 'sent')
+                    print(f"Debug - Successfully processed queued post: post_id={post_id}")
+                    await bot.send_message(user_id, f"Пост отправлен: {description[:50]}{'...' if len(description) > 50 else ''}")
+                    await asyncio.sleep(5)
+                except Exception as e:
+                    print(f"Debug - Error processing queued post {post_id}: {e}")
+                    db.update_queue_status(post_id, 'failed')
+                    await bot.send_message(user_id, f"Ошибка при обработке поста {post_id}: {str(e)}")
+                    await asyncio.sleep(5)
+            # Check if there are any pending posts left
+            next_post = db.get_next_queued_post()
+            if not next_post:
+                try:
+                    db.clear_post_queue()
+                    print(f"Debug - Cleared post_queue as no pending posts remain")
+                except mysql.connector.Error as e:
+                    print(f"Debug - Error clearing post_queue: {e}")
 
 @router.message(F.photo)
 async def handle_photo(message: Message):
@@ -110,6 +128,11 @@ async def handle_photo(message: Message):
         print(f"Debug - No valid photo IDs in message: message_id={message.message_id}")
         await message.reply("Ошибка: отправленные фото имеют недействительные идентификаторы.")
         return
+    valid_photo_ids = [pid for pid in photo_ids if db.is_valid_file_id(pid)]
+    if not valid_photo_ids:
+        print(f"Debug - No valid photo IDs after validation: message_id={message.message_id}")
+        await message.reply("Ошибка: недействительные идентификаторы фото.")
+        return
     if message.media_group_id:
         if message.media_group_id not in media_groups:
             media_groups[message.media_group_id] = {
@@ -121,7 +144,7 @@ async def handle_photo(message: Message):
                 'forward_from_message_id': message.forward_from_message_id,
                 'timeout_task': None
             }
-        media_groups[message.media_group_id]['photo_ids'].extend(photo_ids)
+        media_groups[message.media_group_id]['photo_ids'].extend(valid_photo_ids)
         media_groups[message.media_group_id]['photo_count'] = len(set(media_groups[message.media_group_id]['photo_ids']))
         if message.caption:
             media_groups[message.media_group_id]['caption'] = message.caption
@@ -129,70 +152,123 @@ async def handle_photo(message: Message):
         if media_groups[message.media_group_id]['timeout_task']:
             media_groups[message.media_group_id]['timeout_task'].cancel()
         async def process_media_group(mg_id):
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)  # Wait for all photos in the media group to arrive
             mg_data = media_groups.get(mg_id)
             if mg_data:
-                valid_photo_ids = list(set([pid for pid in mg_data['photo_ids'] if db.is_valid_file_id(pid)]))
+                valid_photo_ids = list(set(mg_data['photo_ids']))
                 if not valid_photo_ids:
                     print(f"Debug - No valid photo IDs in media group: media_group_id={mg_id}")
-                    await bot.send_message(mg_data['user_id'], "Ошибка: все фото в медиагруппе имеют недействительные идентификаторы.")
+                    await bot.send_message(mg_data['user_id'], "Ошибка: недействительные идентификаторы фото.")
                     del media_groups[mg_id]
                     return
                 if mg_data['caption'] or is_forwarded:
                     if await queue_post(
-                        mg_data['user_id'],
-                        valid_photo_ids,
-                        mg_data['caption'],
-                        mg_data['message_id'],
-                        len(valid_photo_ids),
-                        mg_data['forward_from_message_id']
+                            mg_data['user_id'],
+                            valid_photo_ids,
+                            mg_data['caption'],
+                            mg_data['message_id'],
+                            len(valid_photo_ids),
+                            mg_data['forward_from_message_id']
                     ):
                         await bot.send_message(mg_data['user_id'], "Пост добавлен в очередь для обработки.")
-                    del media_groups[mg_id]
+                    else:
+                        await bot.send_message(mg_data['user_id'], "Ошибка: пост уже в очереди или произошла ошибка.")
                 else:
-                    db.log_pending_photo(mg_data['user_id'], mg_data['message_id'], valid_photo_ids, mg_id)
-                    await bot.send_message(mg_data['user_id'], "Фото получено. Пожалуйста, отправьте описание товара.")
-                    del media_groups[mg_id]
+                    try:
+                        await db.log_pending_photo(mg_data['user_id'], mg_data['message_id'], valid_photo_ids, mg_id)
+                        print(f"Debug - Logged media group photos: message_id={mg_data['message_id']}, media_group_id={mg_id}, photo_ids={valid_photo_ids}")
+                        await bot.send_message(mg_data['user_id'], "Фото получено. Пожалуйста, отправьте описание товара.")
+                    except Exception as e:
+                        print(f"Debug - Error logging pending photos: {e}")
+                        await bot.send_message(mg_data['user_id'], f"Ошибка при сохранении фото: {str(e)}")
+                del media_groups[mg_id]
         media_groups[message.media_group_id]['timeout_task'] = asyncio.create_task(process_media_group(message.media_group_id))
     else:
         if is_forwarded or message.caption:
             if await queue_post(
-                message.from_user.id,
-                photo_ids,
-                message.caption or "",
-                message.message_id,
-                photo_count,
-                message.forward_from_message_id
+                    message.from_user.id,
+                    valid_photo_ids,
+                    message.caption or "",
+                    message.message_id,
+                    len(valid_photo_ids),
+                    message.forward_from_message_id
             ):
                 await message.reply("Пост добавлен в очередь для обработки.")
         else:
-            db.log_pending_photo(message.from_user.id, message.message_id, photo_ids)
-            await message.reply("Фото получено. Пожалуйста, отправьте описание товара.")
-            print(f"Debug - Logged pending photo: message_id={message.message_id}, photo_ids={photo_ids}")
+            try:
+                await db.log_pending_photo(message.from_user.id, message.message_id, valid_photo_ids)
+                print(f"Debug - Logged individual photo: message_id={message.message_id}, photo_ids={valid_photo_ids}, photo_count={len(valid_photo_ids)}")
+                await message.reply("Фото получено. Пожалуйста, отправьте описание товара.")
+                # Increased delay to ensure database write is committed
+                await asyncio.sleep(1)
+            except Exception as e:
+                print(f"Debug - Error logging pending photos: {e}")
+                await message.reply(f"Ошибка при сохранении фото: {str(e)}")
 
 @router.message(F.text)
 async def handle_text(message: Message):
     print(f"Debug - Received text: message_id={message.message_id}, text={message.text}")
-    pending = db.get_pending_photos(message.from_user.id)
+    user_id = message.from_user.id
+    # Increased retries and delay to handle slower database operations
+    for attempt in range(10):
+        pending = db.get_pending_photos(user_id)
+        print(f"Debug - Attempt {attempt + 1}/10: Found {len(pending)} pending photos for user_id={user_id}")
+        if pending:
+            break
+        if attempt < 9:
+            await asyncio.sleep(1)
     if not pending:
-        print(f"Debug - No pending photos found for user_id={message.from_user.id}")
+        print(f"Debug - No pending photos found after retries for user_id={user_id}")
         await message.reply("Сначала отправьте фото товара.")
         return
-    # Get the earliest pending photo
-    earliest_pending = min(pending, key=lambda x: x[0])  # Sort by message_id
-    pending_message_id, photo_ids_str, media_group_id = earliest_pending
-    photo_ids = photo_ids_str.split(',')
-    photo_count = len(photo_ids)
-    if not photo_ids:
-        print(f"Debug - No valid photo IDs in pending photos: message_id={pending_message_id}, user_id={message.from_user.id}")
-        await message.reply("Ошибка: сохраненные фото имеют недействительные идентификаторы.")
-        db.clear_pending_photos(message.from_user.id, message_id=pending_message_id)
+    # Sort pending photos by message_id to process in chronological order
+    pending = sorted(pending, key=lambda x: x[0])
+    print(f"Debug - Sorted pending photos: {[p[0] for p in pending]}")
+    # Group photos by media_group_id or non-media-group
+    media_group_pending = [p for p in pending if p[2] is not None]
+    non_media_group_pending = [p for p in pending if p[2] is None]
+    if non_media_group_pending:
+        # Combine all non-media-group photos sent before this description
+        pending_by_message_id = {}
+        for msg_id, photo_ids_str, _ in non_media_group_pending:
+            if msg_id <= message.message_id:  # Only photos sent before this description
+                pending_by_message_id[msg_id] = photo_ids_str.split(',')
+        if pending_by_message_id:
+            photo_ids = list(set([pid for msg_id in pending_by_message_id for pid in pending_by_message_id[msg_id] if db.is_valid_file_id(pid)]))
+            photo_count = len(photo_ids)
+            latest_message_id = max(pending_by_message_id.keys())
+            print(f"Debug - Combining non-media-group photos: message_id={latest_message_id}, photo_ids={photo_ids}, photo_count={photo_count}")
+            if not photo_ids:
+                print(f"Debug - No valid photo IDs in non-media-group pending photos: user_id={user_id}")
+                await message.reply("Ошибка: сохраненные фото имеют недействительные идентификаторы.")
+                for msg_id in pending_by_message_id:
+                    db.clear_pending_photos(user_id, message_id=msg_id, media_group_id=None)
+                return
+            if await queue_post(user_id, photo_ids, message.text, latest_message_id, photo_count):
+                await message.reply("Пост добавлен в очередь для обработки.")
+                print(f"Debug - Cleared combined non-media-group photos: message_id={latest_message_id}, photo_ids={photo_ids}")
+            else:
+                await message.reply("Ошибка: пост уже в очереди или произошла ошибка.")
+            return
+    if media_group_pending:
+        # Process the earliest media group
+        earliest_media_group = min(media_group_pending, key=lambda x: x[0])
+        message_id, photo_ids_str, media_group_id = earliest_media_group
+        photo_ids = list(set(photo_ids_str.split(',')))
+        photo_count = len(photo_ids)
+        print(f"Debug - Processing media group: message_id={message_id}, media_group_id={media_group_id}, photo_ids={photo_ids}, photo_count={photo_count}")
+        if not photo_ids or not all(db.is_valid_file_id(pid) for pid in photo_ids):
+            print(f"Debug - No valid photo IDs in media group: message_id={message_id}, user_id={user_id}")
+            await message.reply("Ошибка: сохраненные фото имеют недействительные идентификаторы.")
+            db.clear_pending_photos(user_id, message_id=message_id, media_group_id=media_group_id)
+            return
+        if await queue_post(user_id, photo_ids, message.text, message_id, photo_count):
+            await message.reply("Пост добавлен в очередь для обработки.")
+            print(f"Debug - Cleared media group photos: message_id={message_id}, media_group_id={media_group_id}, photo_ids={photo_ids}")
+        else:
+            await message.reply("Ошибка: пост уже в очереди или произошла ошибка.")
         return
-    if await queue_post(message.from_user.id, photo_ids, message.text, pending_message_id, photo_count):
-        await message.reply("Пост добавлен в очередь для обработки.")
-        print(f"Debug - Cleared pending photo: message_id={pending_message_id}")
-    else:
-        await message.reply("Пост уже в очереди или произошла ошибка.")
+    await message.reply("Ошибка: нет подходящих фото для обработки.")
 
 async def handle_photo_post(message: Message):
     print(f"Debug - Processing photo post: message_id={message.message_id}, caption={message.caption or ''}, photo_count={len(message.photo)}")
@@ -203,7 +279,6 @@ async def handle_photo_post(message: Message):
         print(f"Debug - No valid photo IDs in handle_photo_post: message_id={message.message_id}")
         await message.reply("Ошибка: недействительные идентификаторы фото.")
         return
-    # Check for existing post with this message_id
     existing_post = db.get_post_by_message_id(message.message_id)
     if existing_post:
         print(f"Debug - Post with message_id={message.message_id} already exists, skipping")
@@ -280,7 +355,7 @@ async def handle_photo_post(message: Message):
                     buyer_price = float(buyer_price_match.group(1)) if buyer_price_match else original_price
                     buyer_percentage_match = re.search(r'([-+]\d+)%', description)
                     buyer_percentage = buyer_percentage_match.group(1) if buyer_percentage_match else None
-                    buyer_caption = f"{corrected_brand} {buyer_price}$ {buyer_percentage or ''} {sizes or sizes_db or ''}".strip()
+                    buyer_caption = f"{corrected_brand} {buyer_price}$ {buyer_percentage + '%' if buyer_percentage else ''} {sizes or sizes_db or ''}".strip()
                     for idx, buyer_group in enumerate(config["forward_to_buyers"]):
                         if idx < len(buyer_message_ids):
                             buyer_message_id = buyer_message_ids[idx]
@@ -374,7 +449,7 @@ async def handle_photo_post(message: Message):
                     sizes,
                     config["forward_to_buyers"],
                     client_message_id,
-                    f"{corrected_brand} {buyer_price}$ {buyer_percentage or ''} {sizes or ''}"
+                    f"{corrected_brand} {buyer_price}$ {buyer_percentage + '%' if buyer_percentage else ''} {sizes or ''}"
                 )
                 return
             except TelegramBadRequest as e:
@@ -445,7 +520,7 @@ async def handle_photo_post(message: Message):
             sizes,
             config["forward_to_buyers"],
             sent_message.message_id,
-            f"{corrected_brand} {buyer_price}$ {buyer_percentage or ''} {sizes or ''}"
+            f"{corrected_brand} {buyer_price}$ {buyer_percentage + '%' if buyer_percentage else ''} {sizes or ''}"
         )
         db.log_post(
             bot_name=BOT_NAME,
@@ -473,7 +548,7 @@ async def forward_to_buyers(message, photo_ids, corrected_brand, price, sizes, b
         if not buyer_chat_id:
             print(f"Debug - Buyer group {buyer_group} not found")
             continue
-        buyer_caption = full_caption.strip() if full_caption else f"{corrected_brand} {price}$ {sizes or ''}"
+        buyer_caption = full_caption.strip() if full_caption else f"{corrected_brand} {price}$ {'' if sizes is None else sizes}"
         print(f"Debug - Sending to buyer group: {buyer_group}, chat_id={buyer_chat_id}, photo_count={len(photo_ids)}")
         try:
             await asyncio.sleep(5)
