@@ -1,7 +1,8 @@
 import re
 import mysql.connector
+import uuid
 import unicodedata
-from config import MYSQL_CONFIG, KNOWN_BRANDS
+from config import MYSQL_CONFIG, KNOWN_BRANDS, BRAND_ABBREVIATIONS
 
 class Database:
     def __init__(self):
@@ -16,33 +17,79 @@ class Database:
         return bool(file_id and isinstance(file_id, str) and len(file_id) > 20 and re.match(r'^[A-Za-z0-9_-]+$', file_id))
 
     def get_corrected_brand(self, input_brand):
-        input_brand = unicodedata.normalize('NFKD', input_brand.lower()).encode('ASCII', 'ignore').decode('ASCII')
-        input_brand = input_brand.replace('с', 'c')
+        input_brand = unicodedata.normalize('NFKD', input_brand.lower()).encode('ASCII', 'ignore').decode('utf-8')
+        input_brand = input_brand.replace('с', 'c').strip()
         print(f"Debug - Normalized brand: {input_brand}")
-        try:
+
+        if input_brand == 'man':
+            print(f"Debug - Input is 'man', returning unchanged")
             self.cursor.execute(
-                "SELECT corrected_name, target_groups, target_topic FROM brands WHERE input_name = %s",
-                (input_brand,)
+                "SELECT corrected_name, target_groups, target_topic FROM brands WHERE input_name = %s OR corrected_name = %s",
+                (input_brand, input_brand)
             )
             result = self.cursor.fetchone()
             if result:
-                print(f"Found in database: {result}")
+                print(f"Debug - Found match in database for 'man': {result}")
                 target_groups = result[1].split(',') if result[1] else []
                 return result[0], target_groups, result[2]
+            return 'Man', [], None
+
+        try:
+            if input_brand in BRAND_ABBREVIATIONS:
+                corrected_brand = BRAND_ABBREVIATIONS[input_brand].lower()
+                print(f"Debug - Matched abbreviation: {input_brand} → {corrected_brand}")
+                self.cursor.execute(
+                    "SELECT corrected_name, target_groups, target_topic FROM brands WHERE input_name = %s OR corrected_name = %s",
+                    (corrected_brand, corrected_brand)
+                )
+                result = self.cursor.fetchone()
+                if result:
+                    print(f"Debug - Found match in database for abbreviation: {result}")
+                    target_groups = result[1].split(',') if result[1] else []
+                    return result[0], target_groups, result[2]
+                return corrected_brand, [], None
+
+            self.cursor.execute(
+                "SELECT corrected_name, target_groups, target_topic FROM brands WHERE input_name = %s OR corrected_name = %s",
+                (input_brand, input_brand)
+            )
+            result = self.cursor.fetchone()
+            if result:
+                print(f"Debug - Found exact match in database: {input_brand} → {result[0]}")
+                target_groups = result[1].split(',') if result[1] else []
+                return result[0], target_groups, result[2]
+
+            for brand in KNOWN_BRANDS:
+                if brand.lower().startswith(input_brand):
+                    print(f"Debug - Prefix match: input={input_brand}, brand={brand}")
+                    self.cursor.execute(
+                        "SELECT corrected_name, target_groups, target_topic FROM brands WHERE corrected_name = %s",
+                        (brand,)
+                    )
+                    result = self.cursor.fetchone()
+                    if result:
+                        print(f"Debug - Found in database after prefix match: {result}")
+                        target_groups = result[1].split(',') if result[1] else []
+                        return result[0], target_groups, result[2]
+                    return brand, [], None
+
             from fuzzywuzzy import fuzz
             best_match = max(KNOWN_BRANDS, key=lambda x: fuzz.partial_ratio(input_brand, x.lower()), default="Unknown")
-            print(f"Best match for '{input_brand}': {best_match}")
-            if best_match != "Unknown":
+            match_score = fuzz.partial_ratio(input_brand, best_match.lower()) if best_match != "Unknown" else 0
+            print(f"Debug - Fuzzy match: input={input_brand}, best_match={best_match}, score={match_score}")
+            if best_match != "Unknown" and match_score > 80:
                 self.cursor.execute(
                     "SELECT corrected_name, target_groups, target_topic FROM brands WHERE corrected_name = %s",
                     (best_match,)
                 )
                 result = self.cursor.fetchone()
                 if result:
-                    print(f"Found in database after fuzzy match: {result}")
+                    print(f"Debug - Found in database after fuzzy match: {result}")
                     target_groups = result[1].split(',') if result[1] else []
                     return result[0], target_groups, result[2]
-            return input_brand, [], None
+                return best_match, [], None
+
+            return "Unknown", [], None
         except mysql.connector.Error as e:
             print(f"Error in get_corrected_brand: {e}")
             raise
@@ -173,17 +220,22 @@ class Database:
             )
             return self.cursor.fetchone()
         except mysql.connector.Error as e:
-            print(f"Error in get_post最_by_brand_and: {e}")
+            print(f"Error in get_post_by_brand_and: {e}")
             raise
 
-    def log_post(self, bot_name, message_id, brand, price, adjusted_price, sizes, photo_ids, client_message_id=None, client_chat_id=None, client_topic_name=None, forward_from_message_id=None, watermarked_photo_ids=None, buyer_message_ids=None):
+    def log_post(self, bot_name, message_id, brand, price, adjusted_price, sizes, photo_ids, client_message_id=None,
+                 client_chat_id=None, client_topic_name=None, forward_from_message_id=None, watermarked_photo_ids=None,
+                 buyer_message_ids=None):
         try:
-            original_price = float(price) / (1 + int(float(adjusted_price.strip('%'))) / 100) if adjusted_price else float(price)
+            original_price = float(price) / (1 + int(float(adjusted_price.strip('%'))) / 100) if adjusted_price else float(
+                price)
             buyer_message_ids_str = ','.join(map(str, buyer_message_ids)) if buyer_message_ids else None
             self.cursor.execute(
                 "INSERT INTO posts (bot_name, message_id, brand, price, original_price, adjusted_price, sizes, photo_ids, client_message_id, client_chat_id, client_topic_name, forward_from_message_id, watermarked_photo_ids, buyer_message_ids) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (bot_name, message_id, brand, float(price), original_price, adjusted_price, sizes, photo_ids, client_message_id, client_chat_id, client_topic_name, forward_from_message_id, watermarked_photo_ids, buyer_message_ids_str)
+                (bot_name, message_id, brand, float(price), original_price, adjusted_price, sizes, photo_ids,
+                 client_message_id, client_chat_id, client_topic_name, forward_from_message_id, watermarked_photo_ids,
+                 buyer_message_ids_str)
             )
             self.conn.commit()
         except mysql.connector.Error as e:
@@ -220,7 +272,10 @@ class Database:
             print(f"Error in get_existing_posts: {e}")
             raise
 
-    async def log_pending_photo(self, user_id, message_id, photo_ids, media_group_id=None):
+    async def log_pending_photo(self, user_id, message_id, photo_ids, batch_id=None, media_group_id=None,
+                                forward_from_message_id=None):
+        print(
+            f"Debug - log_pending_photo called with: user_id={user_id}, message_id={message_id}, photo_ids={photo_ids}, batch_id={batch_id}, media_group_id={media_group_id}, forward_from_message_id={forward_from_message_id}")
         try:
             valid_photo_ids = [pid for pid in photo_ids if self.is_valid_file_id(pid)]
             if not valid_photo_ids:
@@ -228,52 +283,20 @@ class Database:
                 raise ValueError("No valid photo IDs provided")
             valid_photo_ids = list(set(valid_photo_ids))
             photo_ids_str = ','.join(valid_photo_ids)
-            if media_group_id:
-                self.cursor.execute(
-                    "SELECT id, photo_ids FROM pending_photos WHERE user_id = %s AND media_group_id = %s",
-                    (user_id, media_group_id)
-                )
-                result = self.cursor.fetchone()
-                if result:
-                    existing_id, existing_photo_ids = result
-                    existing_ids = existing_photo_ids.split(',') if existing_photo_ids else []
-                    combined_photo_ids = list(set(existing_ids + valid_photo_ids))
-                    combined_photo_ids_str = ','.join(combined_photo_ids)
-                    self.cursor.execute(
-                        "UPDATE pending_photos SET photo_ids=%s, message_id=%s WHERE id=%s",
-                        (combined_photo_ids_str, message_id, existing_id)
-                    )
-                else:
-                    self.cursor.execute(
-                        "INSERT INTO pending_photos (user_id, message_id, photo_ids, media_group_id) "
-                        "VALUES (%s, %s, %s, %s)",
-                        (user_id, message_id, photo_ids_str, media_group_id)
-                    )
-                self.conn.commit()
-                print(f"Debug - Logged/Updated pending media group photo: user_id={user_id}, message_id={message_id}, photos={photo_ids_str}, media_group_id={media_group_id}")
-            else:
-                self.cursor.execute(
-                    "SELECT id, photo_ids FROM pending_photos WHERE user_id = %s AND message_id = %s AND media_group_id IS NULL",
-                    (user_id, message_id)
-                )
-                result = self.cursor.fetchone()
-                if result:
-                    existing_id, existing_photo_ids = result
-                    existing_ids = existing_photo_ids.split(',') if existing_photo_ids else []
-                    combined_photo_ids = list(set(existing_ids + valid_photo_ids))
-                    combined_photo_ids_str = ','.join(combined_photo_ids)
-                    self.cursor.execute(
-                        "UPDATE pending_photos SET photo_ids=%s WHERE id=%s",
-                        (combined_photo_ids_str, existing_id)
-                    )
-                else:
-                    self.cursor.execute(
-                        "INSERT INTO pending_photos (user_id, message_id, photo_ids, media_group_id) "
-                        "VALUES (%s, %s, %s, %s)",
-                        (user_id, message_id, photo_ids_str, media_group_id)
-                    )
-                self.conn.commit()
-                print(f"Debug - Logged/Updated pending photo: user_id={user_id}, message_id={message_id}, photos={photo_ids_str}, media_group_id={media_group_id}")
+            batch_id = batch_id or str(uuid.uuid4())
+            self.cursor.execute(
+                "DELETE FROM pending_photos WHERE user_id = %s AND (batch_id = %s OR (media_group_id = %s AND media_group_id IS NOT NULL))",
+                (user_id, batch_id, media_group_id)
+            )
+            self.conn.commit()
+            self.cursor.execute(
+                "INSERT INTO pending_photos (user_id, message_id, photo_ids, batch_id, media_group_id, forward_from_message_id, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, NOW())",
+                (user_id, message_id, photo_ids_str, batch_id, media_group_id, forward_from_message_id)
+            )
+            self.conn.commit()
+            print(
+                f"Debug - Logged photo: user_id={user_id}, message_id={message_id}, batch_id={batch_id}, photos={photo_ids_str}, media_group_id={media_group_id}, forward_from_message_id={forward_from_message_id}")
         except mysql.connector.Error as e:
             print(f"Debug - Database error logging pending photos: {e}")
             self.conn.rollback()
@@ -282,58 +305,81 @@ class Database:
             print(f"Debug - Error logging pending photos: {e}")
             raise
 
-    def get_pending_photos(self, user_id, media_group_id=None):
+    def get_pending_photos(self, user_id, media_group_id=None, batch_id=None):
         try:
-            if media_group_id:
+            self.cursor.execute(
+                "DELETE FROM pending_photos WHERE user_id = %s AND created_at < NOW() - INTERVAL 5 MINUTE",
+                (user_id,)
+            )
+            self.conn.commit()
+            if batch_id:
                 self.cursor.execute(
-                    "SELECT message_id, photo_ids, media_group_id FROM pending_photos WHERE user_id = %s AND media_group_id = %s ORDER BY timestamp ASC",
+                    "SELECT message_id, photo_ids, media_group_id, forward_from_message_id, batch_id, created_at "
+                    "FROM pending_photos WHERE user_id = %s AND batch_id = %s ORDER BY created_at ASC",
+                    (user_id, batch_id)
+                )
+            elif media_group_id:
+                self.cursor.execute(
+                    "SELECT message_id, photo_ids, media_group_id, forward_from_message_id, batch_id, created_at "
+                    "FROM pending_photos WHERE user_id = %s AND media_group_id = %s ORDER BY created_at ASC",
                     (user_id, media_group_id)
                 )
             else:
                 self.cursor.execute(
-                    "SELECT message_id, photo_ids, media_group_id FROM pending_photos WHERE user_id = %s ORDER BY timestamp ASC",
+                    "SELECT message_id, photo_ids, media_group_id, forward_from_message_id, batch_id, created_at "
+                    "FROM pending_photos WHERE user_id = %s ORDER BY created_at ASC",
                     (user_id,)
                 )
-            return self.cursor.fetchall()
+            results = self.cursor.fetchall()
+            print(f"Debug - Fetched pending photos for user_id={user_id}: count={len(results)}")
+            return results
         except mysql.connector.Error as e:
             print(f"Debug - Error fetching pending photos: {e}")
             return []
 
-    def clear_pending_photos(self, user_id, media_group_id=None, message_id=None):
+    def clear_pending_photos(self, user_id, batch_id=None, media_group_id=None, message_id=None):
         try:
+            query = "DELETE FROM pending_photos WHERE user_id = %s"
+            params = [user_id]
+            if batch_id:
+                query += " AND batch_id = %s"
+                params.append(batch_id)
             if message_id:
-                self.cursor.execute(
-                    "DELETE FROM pending_photos WHERE user_id = %s AND message_id = %s",
-                    (user_id, message_id)
-                )
-            elif media_group_id:
-                self.cursor.execute(
-                    "DELETE FROM pending_photos WHERE user_id = %s AND media_group_id = %s",
-                    (user_id, media_group_id)
-                )
-            else:
-                self.cursor.execute(
-                    "DELETE FROM pending_photos WHERE user_id = %s",
-                    (user_id,)
-                )
+                query += " AND message_id = %s"
+                params.append(message_id)
+            if media_group_id:
+                query += " AND media_group_id = %s"
+                params.append(media_group_id)
+            self.cursor.execute(query, params)
             self.conn.commit()
-            print(f"Debug - Cleared pending photos: user_id={user_id}, message_id={message_id}, media_group_id={media_group_id}")
+            print(
+                f"Debug - Cleared pending photos: user_id={user_id}, batch_id={batch_id}, message_id={message_id}, media_group_id={media_group_id}")
         except mysql.connector.Error as e:
             print(f"Debug - Error clearing pending_photos: {e}")
             self.conn.rollback()
             raise
 
-    def queue_post(self, user_id, photo_ids, description, message_id, photo_count, forward_from_message_id=None):
+    def queue_post(self, user_id, photo_ids, description, message_id, photo_count, batch_id=None,
+                   forward_from_message_id=None):
         try:
             if not photo_ids:
                 raise ValueError("photo_ids cannot be empty")
             photo_ids_str = ','.join(photo_ids)
             self.cursor.execute(
-                "INSERT INTO post_queue (user_id, photo_ids, photo_ids_str, description, photo_count, message_id, status, forward_from_message_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (user_id, photo_ids_str, photo_ids_str, description, photo_count, message_id, 'pending', forward_from_message_id)
+                "SELECT id FROM post_queue WHERE user_id = %s AND batch_id = %s",
+                (user_id, batch_id)
+            )
+            if self.cursor.fetchone():
+                print(f"Debug - Duplicate batch_id detected: user_id={user_id}, batch_id={batch_id}")
+                raise ValueError("Duplicate batch_id in post_queue")
+            self.cursor.execute(
+                "INSERT INTO post_queue (user_id, photo_ids, photo_ids_str, description, photo_count, message_id, status, batch_id, forward_from_message_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (user_id, photo_ids_str, photo_ids_str, description, photo_count, message_id, 'pending', batch_id,
+                 forward_from_message_id)
             )
             self.conn.commit()
+            print(f"Debug - Queued post: user_id={user_id}, message_id={message_id}, batch_id={batch_id}, photo_count={photo_count}")
         except mysql.connector.Error as e:
             print(f"Error queuing post: {e}")
             self.conn.rollback()
@@ -349,7 +395,8 @@ class Database:
                 "SELECT id FROM post_queue WHERE user_id = %s AND photo_ids_str = %s AND photo_count = %s AND description = %s",
                 (user_id, photo_ids_str, photo_count, description)
             )
-            return self.cursor.fetchone()
+            result = self.cursor.fetchone()
+            return result is not None
         except mysql.connector.Error as e:
             print(f"Error in check_queue_duplicate: {e}")
             raise
@@ -368,7 +415,8 @@ class Database:
     def get_next_queued_post(self):
         try:
             self.cursor.execute(
-                "SELECT id, user_id, photo_ids_str, photo_count, description, message_id, forward_from_message_id FROM post_queue WHERE status = 'pending' ORDER BY timestamp ASC LIMIT 1"
+                "SELECT id, user_id, photo_ids_str, photo_count, description, message_id, forward_from_message_id, batch_id "
+                "FROM post_queue WHERE status = 'pending' ORDER BY timestamp ASC LIMIT 1"
             )
             return self.cursor.fetchone()
         except mysql.connector.Error as e:
@@ -409,7 +457,8 @@ class Database:
             self.conn.rollback()
             raise
 
-    def log_forwarded_post(self, user_id, bot_name, message_id, brand, photo_ids, caption, forward_from_message_id, client_message_id):
+    def log_forwarded_post(self, user_id, bot_name, message_id, brand, photo_ids, caption, forward_from_message_id,
+                           client_message_id):
         try:
             photo_ids_str = ','.join(photo_ids)
             self.cursor.execute(
