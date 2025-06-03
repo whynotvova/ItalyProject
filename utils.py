@@ -28,13 +28,28 @@ async def add_watermark(image_data, watermark_text):
             font = ImageFont.truetype("arial.ttf", 40)
         except:
             font = ImageFont.load_default()
+
+        width, height = image.size
         text_bbox = draw.textbbox((0, 0), watermark_text, font=font)
         text_width = text_bbox[2] - text_bbox[0]
         text_height = text_bbox[3] - text_bbox[1]
-        width, height = image.size
-        x = width - text_width - 10
-        y = height - text_height - 10
-        draw.text((x, y), watermark_text, font=font, fill=(255, 255, 255, 128))
+        step_x = width // 3
+        step_y = height // 3
+        rotation_angle = 45
+
+        for i in range(3):
+            for j in range(3):
+                x = step_x * i + step_x // 2 - text_width // 2
+                y = step_y * j + step_y // 2 - text_height // 2
+                text_img = Image.new("RGBA", (text_width * 2, text_height * 2), (255, 255, 255, 0))
+                text_draw = ImageDraw.Draw(text_img)
+                text_draw.text((text_width // 2, text_height // 2), watermark_text, font=font, fill=(255, 255, 255, 110))
+                rotated_text = text_img.rotate(rotation_angle, expand=True)
+                rotated_width, rotated_height = rotated_text.size
+                paste_x = x + (text_width - rotated_width) // 2
+                paste_y = y + (text_height - rotated_height) // 2
+                txt.paste(rotated_text, (paste_x, paste_y), rotated_text)
+
         combined = Image.alpha_composite(image, txt)
         output = io.BytesIO()
         combined.convert('RGB').save(output, format="JPEG", quality=95)
