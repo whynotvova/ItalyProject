@@ -1,4 +1,7 @@
 # Bot tokens and MySQL configuration
+
+contact_url = "https://t.me/Elena_2000"
+
 BOT_TOKENS = {
     "lucia": "7432922492:AAFf_TdrDSJ_zpMwDQOj9Nt12c9p_J6SWII",
     "luna": "8151632568:AAEo3QPayXZgpIAZmUSAi_e0ZBZkBoH97nk",

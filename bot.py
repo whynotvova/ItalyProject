@@ -5,9 +5,9 @@ import re
 import uuid
 import time
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, InputMediaPhoto, BufferedInputFile
+from aiogram.types import Message, InputMediaPhoto, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
-from config import BOT_TOKENS, BOT_CONFIGS, PROJECT_BOT_IDS
+from config import BOT_TOKENS, BOT_CONFIGS, PROJECT_BOT_IDS, contact_url
 from database import Database
 from utils import adjust_price, add_watermark, download_photo, extract_sizes, select_unique_photos
 import mysql.connector
@@ -72,44 +72,49 @@ def update_caption_price_and_percentage(caption, new_price, new_percentage, curr
             flags=re.IGNORECASE
         )
 
+    # Truncate caption to Telegram's limit for media groups (1024 characters)
+    updated_caption = updated_caption[:1024]
     return updated_caption.strip()
 
 async def send_with_retry(func, *args, max_retries=3, **kwargs):
     for attempt in range(max_retries):
         try:
-            return await func(*args, **kwargs)
+            print(f"DEBUG - Sending with retry: attempt={attempt+1}, func={func.__name__}, args={args}, kwargs={kwargs}")
+            result = await func(*args, **kwargs)
+            print(f"DEBUG - Successfully sent: result={result}")
+            return result
         except TelegramBadRequest as e:
-            if "Too Many Requests" in str(e):
+            error_msg = str(e).lower()
+            print(f"DEBUG - TelegramBadRequest: error={str(e)}, attempt={attempt+1}")
+            if "too many requests" in error_msg:
                 delay = 2 ** (attempt + 1)
-                print(f"DEBUG - Rate limit hit, retrying in {delay}s, attempt {attempt + 1}/{max_retries}")
+                print(f"DEBUG - Rate limit hit, retrying in {delay}s")
                 await asyncio.sleep(delay)
+            elif "invalid" in error_msg or "button" in error_msg or "caption" in error_msg:
+                print(f"DEBUG - Invalid markup, button, or caption error: {str(e)}")
+                raise
             else:
                 raise
     raise TelegramBadRequest("Max retries reached due to rate limits")
 
 async def queue_post(user_id, photo_ids, description, message_id, photo_count, batch_id, forward_from_message_id=None):
     if not photo_ids:
-        print(
-            f"DEBUG - Cannot queue post with empty photo_ids: user_id={user_id}, message_id={message_id}, batch_id={batch_id}")
+        print(f"DEBUG - Cannot queue post with empty photo_ids: user_id={user_id}, message_id={message_id}, batch_id={batch_id}")
         await bot.send_message(user_id, "Ошибка: отсутствуют фото для поста.")
         return False
     valid_photo_ids = [pid for pid in photo_ids if db.is_valid_file_id(pid)]
     if not valid_photo_ids:
-        print(
-            f"DEBUG - No valid photo IDs after validation: user_id={user_id}, message_id={message_id}, batch_id={batch_id}")
+        print(f"DEBUG - No valid photo IDs after validation: user_id={user_id}, message_id={message_id}, batch_id={batch_id}")
         await bot.send_message(user_id, "Ошибка: недействительные идентификаторы фото.")
         return False
     photo_ids_str = ','.join(sorted(valid_photo_ids))
     if db.check_queue_duplicate(user_id, valid_photo_ids, len(valid_photo_ids), description):
-        print(
-            f"DEBUG - Duplicate post detected: user_id={user_id}, batch_id={batch_id}, photo_ids={photo_ids_str}, photo_count={len(valid_photo_ids)}")
+        print(f"DEBUG - Duplicate post detected: user_id={user_id}, batch_id={batch_id}, photo_ids={photo_ids_str}, photo_count={len(valid_photo_ids)}")
         await bot.send_message(user_id, "Этот пост уже отправлен.")
         return False
     try:
-        db.queue_post(user_id, valid_photo_ids, description, message_id, len(valid_photo_ids), batch_id,
-                      forward_from_message_id)
-        print(
-            f"DEBUG - Queued post: user_id={user_id}, message_id={message_id}, batch_id={batch_id}, photo_ids={photo_ids_str}, photo_count={len(valid_photo_ids)}")
+        db.queue_post(user_id, valid_photo_ids, description, message_id, len(valid_photo_ids), batch_id, forward_from_message_id)
+        print(f"DEBUG - Queued post: user_id={user_id}, message_id={message_id}, batch_id={batch_id}, photo_ids={photo_ids_str}, photo_count={len(valid_photo_ids)}")
         db.clear_pending_photos(user_id, batch_id=batch_id)
         return True
     except mysql.connector.Error as e:
@@ -147,8 +152,7 @@ async def process_queue():
                 continue
             post_id, user_id, photo_ids_str, photo_count, description, message_id, forward_from_message_id, batch_id = post
             photo_ids = [pid for pid in photo_ids_str.split(',') if db.is_valid_file_id(pid)]
-            print(
-                f"DEBUG - Processing queued post: post_id={post_id}, user_id={user_id}, batch_id={batch_id}, photo_ids={photo_ids}, photo_count={photo_count}")
+            print(f"DEBUG - Processing queued post: post_id={post_id}, user_id={user_id}, batch_id={batch_id}, photo_ids={photo_ids}, photo_count={photo_count}")
             if not photo_ids or len(photo_ids) != photo_count:
                 print(f"DEBUG - Invalid photo IDs or count for post_id={post_id}")
                 db.update_queue_status(post_id, 'failed')
@@ -181,8 +185,7 @@ async def process_queue():
                     await handle_photo_post(mock_message)
                     db.update_queue_status(post_id, 'sent')
                     print(f"DEBUG - Successfully processed queued post: post_id={post_id}, batch_id={batch_id}")
-                    await bot.send_message(user_id,
-                                           f"Пост отправлен: {description[:50]}{'...' if len(description) > 50 else ''}")
+                    await bot.send_message(user_id, f"Пост отправлен: {description[:50]}{'...' if len(description) > 50 else ''}")
                     await asyncio.sleep(5)
                 except Exception as e:
                     print(f"DEBUG - Error processing queued post {post_id}: {e}")
@@ -200,14 +203,11 @@ async def process_queue():
 @router.message(F.photo | F.forward_from | F.forward_from_chat | F.forward_from_message_id)
 async def handle_photo(message: Message):
     is_forwarded = message.forward_from is not None or message.forward_from_chat is not None or message.forward_from_message_id is not None
-    print(
-        f"DEBUG - Processing message: message_id={message.message_id}, is_forwarded={is_forwarded}, has_photo={bool(message.photo)}, caption={message.caption or ''}, media_group_id={message.media_group_id or 'None'}, forward_from_message_id={message.forward_from_message_id or 'None'}")
-
+    print(f"DEBUG - Processing message: message_id={message.message_id}, is_forwarded={is_forwarded}, has_photo={bool(message.photo)}, caption={message.caption or ''}, media_group_id={message.media_group_id or 'None'}")
     if message.photo:
-        batch_id = str(uuid.uuid4()) + f"-{message.message_id}"  # Ensure unique batch_id per message
+        batch_id = str(uuid.uuid4()) + f"-{message.message_id}"
         photo_count = len(message.photo)
-        print(
-            f"DEBUG - Received photo(s): message_id={message.message_id}, batch_id={batch_id}, photo_count={photo_count}, photo_details={[(p.file_id, p.file_size) for p in message.photo]}")
+        print(f"DEBUG - Received photo(s): message_id={message.message_id}, batch_id={batch_id}, photo_count={photo_count}, photo_details={[(p.file_id, p.file_size) for p in message.photo]}")
         photo_ids = select_unique_photos(message.photo)
         if not photo_ids:
             print(f"DEBUG - No valid photo IDs after selection: message_id={message.message_id}, batch_id={batch_id}")
@@ -239,8 +239,7 @@ async def handle_photo(message: Message):
             media_groups[message.media_group_id]['photo_count'] = len(media_groups[message.media_group_id]['photo_ids'])
             if message.caption:
                 media_groups[message.media_group_id]['caption'] = message.caption
-            print(
-                f"DEBUG - Added to media group: media_group_id={message.media_group_id}, batch_id={batch_id}, photo_ids={media_groups[message.media_group_id]['photo_ids']}, photo_count={media_groups[message.media_group_id]['photo_count']}, expected_count={media_groups[message.media_group_id]['expected_count']}")
+            print(f"DEBUG - Added to media group: media_group_id={message.media_group_id}, batch_id={batch_id}, photo_ids={media_groups[message.media_group_id]['photo_ids']}, photo_count={media_groups[message.media_group_id]['photo_count']}, expected_count={media_groups[message.media_group_id]['expected_count']}")
 
             if media_groups[message.media_group_id]['timeout_task']:
                 media_groups[message.media_group_id]['timeout_task'].cancel()
@@ -269,8 +268,7 @@ async def handle_photo(message: Message):
                         media_group_id=mg_id,
                         forward_from_message_id=mg_data['forward_from_message_id']
                     )
-                    print(
-                        f"DEBUG - Logged media group photos: message_id={mg_data['message_id']}, media_group_id={mg_id}, batch_id={batch_id}, photo_ids={valid_photo_ids}, photo_count={mg_data['photo_count']}, forward_from_message_id={mg_data['forward_from_message_id']}")
+                    print(f"DEBUG - Logged media group photos: message_id={mg_data['message_id']}, media_group_id={mg_id}, batch_id={batch_id}, photo_ids={valid_photo_ids}, photo_count={mg_data['photo_count']}, forward_from_message_id={mg_data['forward_from_message_id']}")
                     if mg_data['caption']:
                         if await queue_post(
                                 mg_data['user_id'],
@@ -283,19 +281,16 @@ async def handle_photo(message: Message):
                         ):
                             await bot.send_message(mg_data['user_id'], "Пост добавлен в очередь для обработки.")
                         else:
-                            await bot.send_message(mg_data['user_id'],
-                                                   "Ошибка: пост уже в очереди или произошла ошибка.")
+                            await bot.send_message(mg_data['user_id'], "Ошибка: пост уже в очереди или произошла ошибка.")
                     else:
-                        await bot.send_message(mg_data['user_id'],
-                                               "Фото получено. Пожалуйста, отправьте описание товара.")
+                        await bot.send_message(mg_data['user_id'], "Фото получено. Пожалуйста, отправьте описание товара.")
                     del media_groups[mg_id]
                 except Exception as e:
                     print(f"DEBUG - Error logging pending photos: {e}")
                     await bot.send_message(mg_data['user_id'], f"Ошибка при сохранении фото: {str(e)}")
                     del media_groups[mg_id]
 
-            media_groups[message.media_group_id]['timeout_task'] = asyncio.create_task(
-                process_media_group(message.media_group_id))
+            media_groups[message.media_group_id]['timeout_task'] = asyncio.create_task(process_media_group(message.media_group_id))
         else:
             if message.caption:
                 if await queue_post(
@@ -318,8 +313,7 @@ async def handle_photo(message: Message):
                         media_group_id=None,
                         forward_from_message_id=message.forward_from_message_id
                     )
-                    print(
-                        f"DEBUG - Logged individual photo: message_id={message.message_id}, batch_id={batch_id}, photo_ids={valid_photo_ids}, photo_count={len(valid_photo_ids)}, forward_from_message_id={message.forward_from_message_id}")
+                    print(f"DEBUG - Logged individual photo: message_id={message.message_id}, batch_id={batch_id}, photo_ids={valid_photo_ids}, photo_count={len(valid_photo_ids)}, forward_from_message_id={message.forward_from_message_id}")
                     await message.reply("Фото получено. Пожалуйста, отправьте описание товара.")
                 except Exception as e:
                     print(f"DEBUG - Error logging pending photos: {e}")
@@ -327,8 +321,7 @@ async def handle_photo(message: Message):
     else:
         if is_forwarded:
             if message.text or message.caption:
-                print(
-                    f"DEBUG - Forwarded message without photos, routing to handle_text: message_id={message.message_id}")
+                print(f"DEBUG - Forwarded message without photos, routing to handle_text: message_id={message.message_id}")
                 await handle_text(message)
             else:
                 print(f"DEBUG - Forwarded message with no photos or text: message_id={message.message_id}")
@@ -339,8 +332,7 @@ async def handle_photo(message: Message):
 
 @router.message(F.text | F.forward_from | F.forward_from_chat | F.forward_from_message_id)
 async def handle_text(message: Message):
-    print(
-        f"DEBUG - Received text: message_id={message.message_id}, text={message.text or 'None'}, forward_from_message_id={message.forward_from_message_id or 'None'}")
+    print(f"DEBUG - Received text: message_id={message.message_id}, text={message.text or 'None'}, forward_from_message_id={message.forward_from_message_id or 'None'}")
     user_id = message.from_user.id
     description = message.text or message.caption or ""
     is_forwarded = message.forward_from is not None or message.forward_from_chat is not None or message.forward_from_message_id is not None
@@ -365,8 +357,7 @@ async def handle_text(message: Message):
         message_id, photo_ids_str, media_group_id, forward_from_message_id, batch_id, created_at = p
         if batch_id not in batch_groups:
             batch_groups[batch_id] = []
-        batch_groups[batch_id].append(
-            (message_id, photo_ids_str, media_group_id, forward_from_message_id, batch_id, created_at))
+        batch_groups[batch_id].append((message_id, photo_ids_str, media_group_id, forward_from_message_id, batch_id, created_at))
 
     if not batch_groups:
         print(f"DEBUG - No batch groups formed for user_id={user_id}")
@@ -380,26 +371,20 @@ async def handle_text(message: Message):
         for batch_id, batch in batch_groups.items():
             if any(p[3] == message.forward_from_message_id for p in batch):
                 selected_batch = (batch_id, batch)
-                print(
-                    f"DEBUG - Selected batch by forward_from_message_id: user_id={user_id}, batch_id={batch_id}, forward_from_message_id={message.forward_from_message_id}")
+                print(f"DEBUG - Selected batch by forward_from_message_id: user_id={user_id}, batch_id={batch_id}, forward_from_message_id={message.forward_from_message_id}")
                 break
     if not selected_batch and message.media_group_id:
         # Match by media_group_id
         for batch_id, batch in batch_groups.items():
             if any(p[2] == message.media_group_id for p in batch):
                 selected_batch = (batch_id, batch)
-                print(
-                    f"DEBUG - Selected batch by media_group_id: user_id={user_id}, batch_id={batch_id}, media_group_id={message.media_group_id}")
+                print(f"DEBUG - Selected batch by media_group_id: user_id={user_id}, batch_id={batch_id}, media_group_id={message.media_group_id}")
                 break
     if not selected_batch:
         # Fallback to earliest created_at
-        sorted_batches = sorted(
-            batch_groups.items(),
-            key=lambda x: min(p[5] for p in x[1])
-        )
+        sorted_batches = sorted(batch_groups.items(), key=lambda x: min(p[5] for p in x[1]))
         selected_batch = sorted_batches[0]
-        print(
-            f"DEBUG - Selected earliest batch: user_id={user_id}, batch_id={selected_batch[0]}, photos_count={len(selected_batch[1])}")
+        print(f"DEBUG - Selected earliest batch: user_id={user_id}, batch_id={selected_batch[0]}, photos_count={len(selected_batch[1])}")
 
     batch_id, pending_batch = selected_batch
 
@@ -418,8 +403,7 @@ async def handle_text(message: Message):
     photo_count = len(photo_ids)
     latest_message_id = max(message_ids) if message_ids else message.message_id
 
-    print(
-        f"DEBUG - Processed batch: user_id={user_id}, batch_id={batch_id}, photo_ids={photo_ids}, photo_count={photo_count}, message_ids={message_ids}")
+    print(f"DEBUG - Processed batch: user_id={user_id}, batch_id={batch_id}, photo_ids={photo_ids}, photo_count={photo_count}, message_ids={message_ids}")
     if not photo_ids:
         print(f"DEBUG - No valid photo IDs in batch_id={batch_id}, user_id={user_id}")
         await message.reply("Ошибка: сохраненные изображения имеют невалидные идентификаторы.")
@@ -442,8 +426,7 @@ async def handle_text(message: Message):
         print(f"DEBUG - Failed to queue post: user_id={user_id}, batch_id={batch_id}, photo_ids={photo_ids}")
 
 async def handle_photo_post(message: Message):
-    print(
-        f"DEBUG - Processing photo post: message_id={message.message_id}, caption={message.caption or ''}, photo_count={len(message.photo) if message.photo else 0}")
+    print(f"DEBUG - Processing photo post: message_id={message.message_id}, caption={message.caption or ''}, photo_count={len(message.photo) if message.photo else 0}")
     description = message.caption or ""
     photo_ids = select_unique_photos(message.photo) if message.photo else []
     print(f"DEBUG - Processed photo IDs: {photo_ids}, count={len(photo_ids)}")
@@ -451,10 +434,12 @@ async def handle_photo_post(message: Message):
         print(f"DEBUG - No valid photo IDs in handle_photo_post: message_id={message.message_id}")
         await message.reply("Ошибка: Недействительные идентификаторы фото.")
         return
+
     existing_post = db.get_post_by_message_id(message.message_id)
     if existing_post:
         print(f"DEBUG - Post with message_id={message.message_id} already exists, skipping")
         return
+
     brand_match = re.search(r'^\s*([A-Za-z\s&]+)(?:\s*[\W\s]*(?:\d+\.?\d*\s*[€$]|\s*$))?', description, re.IGNORECASE)
     brand = brand_match.group(1).strip() if brand_match else "Unknown"
     price_match = re.search(r'(\d+\.?\d*)\s*([€$])', description)
@@ -470,6 +455,13 @@ async def handle_photo_post(message: Message):
         cleaned_brand = re.sub(r'[^\w\s]', '', brand.lower())
         corrected_brand, target_groups, target_topic = db.get_corrected_brand(cleaned_brand)
     print(f"DEBUG - Corrected brand: {corrected_brand}")
+
+    if contact_url == "https://t.me/your_contact":
+        print("WARNING - Placeholder URL detected. Replace 'https://t.me/your_contact' with a valid Telegram link.")
+    client_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Contact Us", url=contact_url)]
+    ])
+
     if is_forwarded and message.forward_from_message_id:
         db.clear_stale_forwarded_posts(message.from_user.id)
         post = None
@@ -483,6 +475,7 @@ async def handle_photo_post(message: Message):
             await message.reply("Исходный пост не найден.")
             print(f"DEBUG - No post found for forwarded post")
             return
+
         brand, current_price, original_price, photo_ids_db, client_message_id, client_chat_id, client_topic_name, sizes_db = post
         print(f"DEBUG - Found post: client_message_id={client_message_id}")
         if not client_message_id or not client_chat_id:
@@ -491,22 +484,34 @@ async def handle_photo_post(message: Message):
         if not original_price:
             await message.reply("Отсутствует исходная цена.")
             return
-        adjusted_price, percentage, adjusted_currency = adjust_price(description) if config["adjust_price"] else (
-            original_price, None, currency)
+
+        adjusted_price, percentage, adjusted_currency = adjust_price(description) if config["adjust_price"] else (original_price, None, currency)
         if not adjusted_price:
             await message.reply("Не удалось определить цену.")
             return
+
         client_percentage = f"{percentage}" if percentage else None
-        client_caption = update_caption_price_and_percentage(description, adjusted_price, client_percentage,
-                                                             adjusted_currency, corrected_brand)
+        client_caption = update_caption_price_and_percentage(description, adjusted_price, client_percentage, adjusted_currency, corrected_brand)
+
+        # Append link for media groups
+        if len(photo_ids) > 1:
+            client_caption = f"{client_caption}\n\nНаписать: {contact_url}"[:1024]
+            print(f"DEBUG - Appended link to caption for forwarded media group post: caption={client_caption}")
+
+        print(f"DEBUG - Processing forwarded client post: client_message_id={client_message_id}")
+
         try:
             await bot.delete_message(chat_id=client_chat_id, message_id=client_message_id)
             await asyncio.sleep(5)
             if len(photo_ids) > 1:
                 media_group = [
-                    InputMediaPhoto(media=pid, caption=client_caption if i == 0 else None)
+                    InputMediaPhoto(
+                        media=pid,
+                        caption=client_caption if i == 0 else None
+                    )
                     for i, pid in enumerate(photo_ids)
                 ]
+                print(f"DEBUG - Sending media group to client with link in caption: photos={len(photo_ids)}, caption={client_caption}")
                 sent_messages = await send_with_retry(
                     bot.send_media_group,
                     chat_id=client_chat_id,
@@ -514,17 +519,23 @@ async def handle_photo_post(message: Message):
                     message_thread_id=db.get_topic_thread_id(client_chat_id, client_topic_name)
                 )
                 new_client_message_id = sent_messages[0].message_id
+                print(f"DEBUG - Sent media group to client: new_message_id={new_client_message_id}")
             else:
+                print(f"DEBUG - Sending single photo to client with keyboard: caption={client_caption}")
                 sent_message = await send_with_retry(
                     bot.send_photo,
                     chat_id=client_chat_id,
                     photo=photo_ids[0],
                     caption=client_caption,
+                    reply_markup=client_keyboard,
                     message_thread_id=db.get_topic_thread_id(client_chat_id, client_topic_name)
                 )
                 new_client_message_id = sent_message.message_id
+                print(f"DEBUG - Sent single photo to client: new_message_id={new_client_message_id}")
+
             db.update_post_price(new_client_message_id, adjusted_price, percentage)
             print(f"DEBUG - Replaced client post {client_message_id} with new message_id={new_client_message_id}")
+
             post = db.get_post_by_client_message_id(client_message_id)
             if post:
                 _, _, _, _, _, _, _, _, buyer_message_ids_str = post
@@ -532,8 +543,7 @@ async def handle_photo_post(message: Message):
                     buyer_message_ids = buyer_message_ids_str.split(',')
                     buyer_price = original_price
                     buyer_currency = adjusted_currency
-                    buyer_caption = update_caption_price_and_percentage(description, buyer_price, original_percentage,
-                                                                        buyer_currency, corrected_brand)
+                    buyer_caption = update_caption_price_and_percentage(description, buyer_price, original_percentage, buyer_currency, corrected_brand)
                     for idx, buyer_group in enumerate(config["forward_to_buyers"]):
                         if idx < len(buyer_message_ids):
                             buyer_message_id = buyer_message_ids[idx]
@@ -553,6 +563,7 @@ async def handle_photo_post(message: Message):
                                             media=media_group
                                         )
                                         new_buyer_message_id = sent_buyer[0].message_id
+                                        print(f"DEBUG - Sent media group to buyer: group={buyer_group}, message_id={new_buyer_message_id}")
                                     else:
                                         sent_buyer_message = await send_with_retry(
                                             bot.send_photo,
@@ -561,6 +572,7 @@ async def handle_photo_post(message: Message):
                                             caption=buyer_caption
                                         )
                                         new_buyer_message_id = sent_buyer_message.message_id
+                                        print(f"DEBUG - Sent single photo to buyer: group={buyer_group}, message_id={new_buyer_message_id}")
                                     buyer_message_ids[idx] = str(new_buyer_message_id)
                                     print(f"DEBUG - Replaced buyer post in {buyer_group}")
                                     await asyncio.sleep(5)
@@ -599,6 +611,7 @@ async def handle_photo_post(message: Message):
             await message.reply(f"Ошибка при отправке поста: {str(e)}")
             db.delete_forwarded_post(message.message_id)
         return
+
     if config["sort_by_brand"]:
         if corrected_brand == "Unknown":
             await message.reply("Не удалось определить бренд.")
@@ -613,17 +626,16 @@ async def handle_photo_post(message: Message):
         if not target_group or not target_topic:
             await message.reply("Отсутствует конфигурация группы или темы.")
             return
+
     existing_posts = db.get_existing_posts(corrected_brand, photo_ids, price, message.message_id)
     if existing_posts:
         for client_message_id, client_chat_id, client_topic_name, _, existing_sizes in existing_posts:
-            adjusted_price, percentage, adjusted_currency = adjust_price(description) if config["adjust_price"] else (
-                price, None, currency)
+            adjusted_price, percentage, adjusted_currency = adjust_price(description) if config["adjust_price"] else (price, None, currency)
             if not adjusted_price:
                 await message.reply("Не удалось определить цену для обновления поста.")
                 return
             client_percentage = f"{percentage}" if percentage else None
-            client_caption = update_caption_price_and_percentage(description, adjusted_price, client_percentage,
-                                                                 adjusted_currency, corrected_brand)
+            client_caption = update_caption_price_and_percentage(description, adjusted_price, client_percentage, adjusted_currency, corrected_brand)
             try:
                 await bot.edit_message_caption(
                     chat_id=client_chat_id,
@@ -633,8 +645,7 @@ async def handle_photo_post(message: Message):
                 db.update_post_price(client_message_id, adjusted_price, percentage)
                 buyer_price = price
                 buyer_currency = currency
-                buyer_caption = update_caption_price_and_percentage(description, buyer_price, original_percentage,
-                                                                    buyer_currency, corrected_brand)
+                buyer_caption = update_caption_price_and_percentage(description, buyer_price, original_percentage, buyer_currency, corrected_brand)
                 await forward_to_buyers(
                     message,
                     photo_ids,
@@ -645,13 +656,17 @@ async def handle_photo_post(message: Message):
                     client_message_id,
                     buyer_caption
                 )
+                print(f"DEBUG - Updated existing client post: message_id={client_message_id}")
                 return
             except TelegramBadRequest as e:
                 if "message is not modified" in str(e):
                     await message.reply("Описание поста не изменено.")
+                    print(f"DEBUG - Message not modified for client post: message_id={client_message_id}")
                 else:
                     await message.reply(f"Ошибка при обновлении поста: {str(e)}")
+                    print(f"DEBUG - Error updating client post: {e}")
                 return
+
     watermarked_photos = []
     watermarked_photo_ids = [None] * len(photo_ids)
     if config.get("add_watermark"):
@@ -666,29 +681,41 @@ async def handle_photo_post(message: Message):
                 watermarked_photos.append(photo_id)
     else:
         watermarked_photos = photo_ids.copy()
+
     chat_id = db.get_group_info(target_group)
     if not chat_id:
         await message.reply(f"Группа {target_group} не найдена.")
         return
-    message_thread_id = db.get_topic_thread_id(target_group, target_topic)
-    print(
-        f"DEBUG - Sending to client group: {target_group}, chat_id={chat_id}, topic={target_topic}, message_thread_id={message_thread_id}, photo_count={len(photo_ids)}")
 
-    adjusted_price, percentage, adjusted_currency = adjust_price(description) if config["adjust_price"] else (
-        price, None, currency)
+    message_thread_id = db.get_topic_thread_id(target_group, target_topic)
+    print(f"DEBUG - Sending to client group: {target_group}, chat_id={chat_id}, topic={target_topic}, message_thread_id={message_thread_id}, photo_count={len(photo_ids)}")
+
+    adjusted_price, percentage, adjusted_currency = adjust_price(description) if config["adjust_price"] else (price, None, currency)
     if not adjusted_price:
         await message.reply("Не удалось определить цену для поста.")
         return
+
     client_percentage = f"{percentage}" if percentage else None
-    client_caption = update_caption_price_and_percentage(description, adjusted_price, client_percentage,
-                                                         adjusted_currency, corrected_brand)
+    client_caption = update_caption_price_and_percentage(description, adjusted_price, client_percentage, adjusted_currency, corrected_brand)
+
+    # Append link for media groups
+    if len(watermarked_photos) > 1:
+        client_caption = f"{client_caption}\nНаписать: {contact_url}"[:1024]
+        print(f"DEBUG - Appended link to caption for new media group post: caption={client_caption}")
+
+    print(f"DEBUG - Preparing to send new client post: caption={client_caption}")
+
     try:
         await asyncio.sleep(5)
         if len(watermarked_photos) > 1:
             media_group = [
-                InputMediaPhoto(media=photo, caption=client_caption if i == 0 else None)
+                InputMediaPhoto(
+                    media=photo,
+                    caption=client_caption if i == 0 else None
+                )
                 for i, photo in enumerate(watermarked_photos)
             ]
+            print(f"DEBUG - Sending media group to client with link in caption: photos={len(watermarked_photos)}, caption={client_caption}")
             sent_messages = await send_with_retry(
                 bot.send_media_group,
                 chat_id=chat_id,
@@ -696,20 +723,26 @@ async def handle_photo_post(message: Message):
                 message_thread_id=message_thread_id
             )
             sent_message = sent_messages[0]
+            print(f"DEBUG - Sent media group to client: message_id={sent_message.message_id}")
             if config["add_watermark"]:
                 watermarked_photo_ids = [msg.photo[-1].file_id for msg in sent_messages if msg.photo]
         else:
+            print(f"DEBUG - Sending single photo to client with keyboard: caption={client_caption}")
             sent_message = await send_with_retry(
                 bot.send_photo,
                 chat_id=chat_id,
                 photo=watermarked_photos[0],
                 caption=client_caption,
+                reply_markup=client_keyboard,
                 message_thread_id=message_thread_id
             )
+            print(f"DEBUG - Sent single photo to client: message_id={sent_message.message_id}")
             if config["add_watermark"] and sent_message.photo:
                 watermarked_photo_ids[0] = sent_message.photo[-1].file_id
+
         print(f"DEBUG - Successfully sent to client group {target_group}: message_id={sent_message.message_id}")
         await asyncio.sleep(5)
+
         buyer_price = price
         buyer_currency = currency
         buyer_caption = update_caption_price_and_percentage(description, buyer_price, original_percentage, buyer_currency, corrected_brand)
@@ -723,6 +756,7 @@ async def handle_photo_post(message: Message):
             sent_message.message_id,
             buyer_caption
         )
+
         db.log_post(
             bot_name=BOT_NAME,
             message_id=message.message_id,
@@ -730,20 +764,20 @@ async def handle_photo_post(message: Message):
             price=adjusted_price or price,
             adjusted_price=percentage,
             sizes=sizes,
-            photo_ids=','.join(photo_ids),
+            photo_ids=','.join(sorted(photo_ids)),
             client_message_id=sent_message.message_id,
             client_chat_id=chat_id,
             client_topic_name=target_topic,
             forward_from_message_id=message.forward_from_message_id,
             watermarked_photo_ids=','.join([pid for pid in watermarked_photo_ids if pid])
         )
+
     except Exception as e:
         print(f"DEBUG - Error sending to client group {target_group}: {e}")
         await message.reply(f"Ошибка при отправке в пост: {str(e)}")
         raise
 
-async def forward_to_buyers(message, photo_ids, corrected_brand, price, sizes, buyer_groups, client_message_id,
-                            full_caption=None):
+async def forward_to_buyers(message, photo_ids, corrected_brand, price, sizes, buyer_groups, client_message_id, full_caption=None):
     buyer_message_ids = []
     for buyer in buyer_groups:
         buyer_chat_id = db.get_group_info(buyer)
@@ -765,6 +799,7 @@ async def forward_to_buyers(message, photo_ids, corrected_brand, price, sizes, b
                     media=media_group
                 )
                 buyer_message_id = sent_messages[0].message_id
+                print(f"DEBUG - Sent media group to buyer: group={buyer}, message_id={buyer_message_id}")
             else:
                 sent_message = await send_with_retry(
                     bot.send_photo,
@@ -773,12 +808,14 @@ async def forward_to_buyers(message, photo_ids, corrected_brand, price, sizes, b
                     caption=buyer_caption
                 )
                 buyer_message_id = sent_message.message_id
+                print(f"DEBUG - Sent single photo to buyer: group={buyer}, message_id={buyer_message_id}")
             buyer_message_ids.append(buyer_message_id)
-            print(f"Successfully sent to buyer group: {buyer}")
+            print(f"DEBUG - Successfully sent to buyer group: {buyer}")
             await asyncio.sleep(5)
         except Exception as e:
-            print(f"Error sending to buyer group {buyer}: {str(e)}")
+            print(f"DEBUG - Error sending to buyer group {buyer}: {e}")
             continue
+
     if buyer_message_ids:
         try:
             buyer_message_ids_str = ','.join(map(str, buyer_message_ids))
@@ -787,9 +824,9 @@ async def forward_to_buyers(message, photo_ids, corrected_brand, price, sizes, b
                 (buyer_message_ids_str, client_message_id)
             )
             db.conn.commit()
-            print(f"Successfully updated buyer_message_ids for client_message_id={client_message_id}")
+            print(f"DEBUG - Successfully updated buyer_message_ids for client_message_id={client_message_id}")
         except Exception as e:
-            print(f"Error updating buyer_message_ids: {e}")
+            print(f"DEBUG - Error updating buyer_message_ids: {e}")
 
 async def main():
     print(f"Bot {BOT_NAME} started!")
