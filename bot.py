@@ -72,7 +72,6 @@ def update_caption_price_and_percentage(caption, new_price, new_percentage, curr
             flags=re.IGNORECASE
         )
 
-    # Truncate caption to Telegram's limit for media groups (1024 characters)
     updated_caption = updated_caption[:1024]
     return updated_caption.strip()
 
@@ -141,7 +140,7 @@ async def cleanup_stale_media_groups():
                 media_groups[mg_id]['timeout_task'].cancel()
             del media_groups[mg_id]
             print(f"DEBUG - Cleaned up stale media group: media_group_id={mg_id}")
-        await asyncio.sleep(60)  # Check every minute
+        await asyncio.sleep(60)
 
 async def process_queue():
     while True:
@@ -156,7 +155,7 @@ async def process_queue():
             if not photo_ids or len(photo_ids) != photo_count:
                 print(f"DEBUG - Invalid photo IDs or count for post_id={post_id}")
                 db.update_queue_status(post_id, 'failed')
-                await bot.send_message(user_id, f"Ошибка: недействительные фото для поста {post_id}.")
+                await bot.send_message(user_id, f"Ошибка: недействительные фото для поста {post_id}.", reply_to_message_id=message_id)
                 await asyncio.sleep(5)
             else:
                 try:
@@ -185,12 +184,20 @@ async def process_queue():
                     await handle_photo_post(mock_message)
                     db.update_queue_status(post_id, 'sent')
                     print(f"DEBUG - Successfully processed queued post: post_id={post_id}, batch_id={batch_id}")
-                    await bot.send_message(user_id, f"Пост отправлен: {description[:50]}{'...' if len(description) > 50 else ''}")
+                    await bot.send_message(
+                        user_id,
+                        f"Пост отправлен: {description[:50]}{'...' if len(description) > 50 else ''}",
+                        reply_to_message_id=message_id
+                    )
                     await asyncio.sleep(5)
                 except Exception as e:
                     print(f"DEBUG - Error processing queued post {post_id}: {e}")
                     db.update_queue_status(post_id, 'failed')
-                    await bot.send_message(user_id, f"Ошибка при обработке поста {post_id}: {str(e)}")
+                    await bot.send_message(
+                        user_id,
+                        f"Ошибка при обработке поста {post_id}: {str(e)}",
+                        reply_to_message_id=message_id
+                    )
                     await asyncio.sleep(5)
             next_post = db.get_next_queued_post()
             if not next_post:
@@ -227,7 +234,7 @@ async def handle_photo(message: Message):
                     'message_id': message.message_id,
                     'photo_ids': [],
                     'photo_count': 0,
-                    'expected_count': photo_count,  # Track expected photos
+                    'expected_count': photo_count,
                     'caption': message.caption or '',
                     'forward_from_message_id': message.forward_from_message_id,
                     'batch_id': batch_id,
@@ -248,7 +255,6 @@ async def handle_photo(message: Message):
                 mg_data = media_groups.get(mg_id)
                 if not mg_data:
                     return
-                # Wait until all photos are collected or timeout
                 start_time = time.time()
                 while mg_data['photo_count'] < mg_data['expected_count'] and time.time() - start_time < 10:
                     await asyncio.sleep(0.5)
@@ -364,28 +370,9 @@ async def handle_text(message: Message):
         await message.reply("Ошибка: не удалось найти ожидающие фото.")
         return
 
-    # Prioritize batch matching
-    selected_batch = None
-    if is_forwarded and message.forward_from_message_id:
-        # Exact match by forward_from_message_id
-        for batch_id, batch in batch_groups.items():
-            if any(p[3] == message.forward_from_message_id for p in batch):
-                selected_batch = (batch_id, batch)
-                print(f"DEBUG - Selected batch by forward_from_message_id: user_id={user_id}, batch_id={batch_id}, forward_from_message_id={message.forward_from_message_id}")
-                break
-    if not selected_batch and message.media_group_id:
-        # Match by media_group_id
-        for batch_id, batch in batch_groups.items():
-            if any(p[2] == message.media_group_id for p in batch):
-                selected_batch = (batch_id, batch)
-                print(f"DEBUG - Selected batch by media_group_id: user_id={user_id}, batch_id={batch_id}, media_group_id={message.media_group_id}")
-                break
-    if not selected_batch:
-        # Fallback to earliest created_at
-        sorted_batches = sorted(batch_groups.items(), key=lambda x: min(p[5] for p in x[1]))
-        selected_batch = sorted_batches[0]
-        print(f"DEBUG - Selected earliest batch: user_id={user_id}, batch_id={selected_batch[0]}, photos_count={len(selected_batch[1])}")
-
+    # Сортируем по времени создания (created_at) и выбираем самую раннюю пару
+    sorted_batches = sorted(batch_groups.items(), key=lambda x: min(p[5] for p in x[1]))
+    selected_batch = sorted_batches[0]
     batch_id, pending_batch = selected_batch
 
     photo_ids = []
@@ -421,6 +408,8 @@ async def handle_text(message: Message):
     ):
         await message.reply("Пост добавлен в очередь для обработки.")
         print(f"DEBUG - Successfully queued post for batch_id={batch_id}, user_id={user_id}, photo_ids={photo_ids}")
+        # Добавляем задержку перед обработкой следующей пары
+        await asyncio.sleep(5)
     else:
         await message.reply("Ошибка: Пост уже в очереди или произошла ошибка.")
         print(f"DEBUG - Failed to queue post: user_id={user_id}, batch_id={batch_id}, photo_ids={photo_ids}")
@@ -493,7 +482,6 @@ async def handle_photo_post(message: Message):
         client_percentage = f"{percentage}" if percentage else None
         client_caption = update_caption_price_and_percentage(description, adjusted_price, client_percentage, adjusted_currency, corrected_brand)
 
-        # Append link for media groups
         if len(photo_ids) > 1:
             client_caption = f"{client_caption}\n\nНаписать: {contact_url}"[:1024]
             print(f"DEBUG - Appended link to caption for forwarded media group post: caption={client_caption}")
@@ -541,7 +529,7 @@ async def handle_photo_post(message: Message):
                 _, _, _, _, _, _, _, _, buyer_message_ids_str = post
                 if buyer_message_ids_str:
                     buyer_message_ids = buyer_message_ids_str.split(',')
-                    buyer_price = original_price
+                    buyer_price = int(original_price)  # Ensure integer price for buyers
                     buyer_currency = adjusted_currency
                     buyer_caption = update_caption_price_and_percentage(description, buyer_price, original_percentage, buyer_currency, corrected_brand)
                     for idx, buyer_group in enumerate(config["forward_to_buyers"]):
@@ -600,7 +588,7 @@ async def handle_photo_post(message: Message):
                 message,
                 photo_ids,
                 corrected_brand,
-                buyer_price,
+                int(original_price),  # Ensure integer price for buyers
                 sizes,
                 config["forward_to_buyers"],
                 new_client_message_id,
@@ -643,7 +631,7 @@ async def handle_photo_post(message: Message):
                     caption=client_caption
                 )
                 db.update_post_price(client_message_id, adjusted_price, percentage)
-                buyer_price = price
+                buyer_price = int(price)  # Ensure integer price for buyers
                 buyer_currency = currency
                 buyer_caption = update_caption_price_and_percentage(description, buyer_price, original_percentage, buyer_currency, corrected_brand)
                 await forward_to_buyers(
@@ -698,7 +686,6 @@ async def handle_photo_post(message: Message):
     client_percentage = f"{percentage}" if percentage else None
     client_caption = update_caption_price_and_percentage(description, adjusted_price, client_percentage, adjusted_currency, corrected_brand)
 
-    # Append link for media groups
     if len(watermarked_photos) > 1:
         client_caption = f"{client_caption}\nНаписать: {contact_url}"[:1024]
         print(f"DEBUG - Appended link to caption for new media group post: caption={client_caption}")
@@ -743,7 +730,7 @@ async def handle_photo_post(message: Message):
         print(f"DEBUG - Successfully sent to client group {target_group}: message_id={sent_message.message_id}")
         await asyncio.sleep(5)
 
-        buyer_price = price
+        buyer_price = int(price)  # Ensure integer price for buyers
         buyer_currency = currency
         buyer_caption = update_caption_price_and_percentage(description, buyer_price, original_percentage, buyer_currency, corrected_brand)
         await forward_to_buyers(
@@ -761,7 +748,7 @@ async def handle_photo_post(message: Message):
             bot_name=BOT_NAME,
             message_id=message.message_id,
             brand=corrected_brand,
-            price=adjusted_price or price,
+            price=int(adjusted_price) or int(price),
             adjusted_price=percentage,
             sizes=sizes,
             photo_ids=','.join(sorted(photo_ids)),
