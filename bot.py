@@ -285,11 +285,11 @@ async def handle_photo(message: Message):
                                 batch_id,
                                 mg_data['forward_from_message_id']
                         ):
-                            await bot.send_message(mg_data['user_id'], "Пост добавлен в очередь для обработки.")
+                            print('Пост добавлен в очередь')
                         else:
                             await bot.send_message(mg_data['user_id'], "Ошибка: пост уже в очереди или произошла ошибка.")
                     else:
-                        await bot.send_message(mg_data['user_id'], "Фото получено. Пожалуйста, отправьте описание товара.")
+                        print('Фото получено')
                     del media_groups[mg_id]
                 except Exception as e:
                     print(f"DEBUG - Error logging pending photos: {e}")
@@ -308,7 +308,7 @@ async def handle_photo(message: Message):
                         batch_id,
                         message.forward_from_message_id
                 ):
-                    await message.reply("Пост добавлен в очередь для обработки.")
+                    print('Пост добавлен в очередь для обработки!')
             else:
                 try:
                     await db.log_pending_photo(
@@ -320,7 +320,7 @@ async def handle_photo(message: Message):
                         forward_from_message_id=message.forward_from_message_id
                     )
                     print(f"DEBUG - Logged individual photo: message_id={message.message_id}, batch_id={batch_id}, photo_ids={valid_photo_ids}, photo_count={len(valid_photo_ids)}, forward_from_message_id={message.forward_from_message_id}")
-                    await message.reply("Фото получено. Пожалуйста, отправьте описание товара.")
+                    print('Фото получено')
                 except Exception as e:
                     print(f"DEBUG - Error logging pending photos: {e}")
                     await message.reply(f"Ошибка при сохранении фото: {str(e)}")
@@ -406,7 +406,7 @@ async def handle_text(message: Message):
             batch_id,
             message.forward_from_message_id if is_forwarded else selected_forward_from_message_id
     ):
-        await message.reply("Пост добавлен в очередь для обработки.")
+        print('Пост добавлен в очередь!')
         print(f"DEBUG - Successfully queued post for batch_id={batch_id}, user_id={user_id}, photo_ids={photo_ids}")
         # Добавляем задержку перед обработкой следующей пары
         await asyncio.sleep(5)
@@ -414,6 +414,36 @@ async def handle_text(message: Message):
         await message.reply("Ошибка: Пост уже в очереди или произошла ошибка.")
         print(f"DEBUG - Failed to queue post: user_id={user_id}, batch_id={batch_id}, photo_ids={photo_ids}")
 
+    pending_count = 0
+    try:
+        db.cursor.execute("SELECT COUNT(*) FROM pending_photos WHERE user_id = %s", (user_id,))
+        pending_count = db.cursor.fetchone()[0]
+        db.conn.commit()
+        print(f"DEBUG - Checked pending_photos for user_id={user_id}, count={pending_count}")
+    except Exception as e:
+        print(f"DEBUG - Error checking pending_photos: {e}")
+        pending_count = 1
+
+    if pending_count == 0:
+        total_queued = 0
+        try:
+            db.cursor.execute("SELECT COUNT(*) FROM post_queue WHERE user_id = %s", (user_id,))
+            total_queued = db.cursor.fetchone()[0]
+            db.conn.commit()
+            print(f"DEBUG - Queried post_queue for user_id={user_id}, total_queued={total_queued}")
+        except Exception as e:
+            print(f"DEBUG - Error querying post_queue: {e}")
+            total_queued = 0
+
+        summary_message = await bot.send_message(
+            user_id,
+            f"Всего в очереди: {total_queued} пост{'' if total_queued == 1 else 'а' if 2 <= total_queued <= 4 else 'ов'}"
+        )
+        await asyncio.sleep(1)
+        try:
+            await bot.delete_message(user_id, summary_message.message_id)
+        except Exception as e:
+            print(f"DEBUG - Error deleting summary message: {e}")
 async def handle_photo_post(message: Message):
     print(f"DEBUG - Processing photo post: message_id={message.message_id}, caption={message.caption or ''}, photo_count={len(message.photo) if message.photo else 0}")
     description = message.caption or ""
@@ -448,7 +478,7 @@ async def handle_photo_post(message: Message):
     if contact_url == "https://t.me/your_contact":
         print("WARNING - Placeholder URL detected. Replace 'https://t.me/your_contact' with a valid Telegram link.")
     client_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Contact Us", url=contact_url)]
+        [InlineKeyboardButton(text="Написать", url=contact_url)]
     ])
 
     if is_forwarded and message.forward_from_message_id:
